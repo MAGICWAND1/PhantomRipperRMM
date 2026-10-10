@@ -33,6 +33,11 @@ router.post('/login', async (req, res) => {
     secret = config.totpSecret;
     await auth.setTotpSecret(username, secret);
   }
+  if (secret && config.totpSecret && secret !== config.totpSecret) {
+    // env rotation is authoritative: stored secret follows the configured one
+    secret = config.totpSecret;
+    await auth.setTotpSecret(username, secret);
+  }
 
   const ticket = auth.issueTotpTicket(username);
 
